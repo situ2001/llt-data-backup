@@ -11,10 +11,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -33,6 +29,8 @@ jobs:
   backup:
     needs: check
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: offline-data-backup
     runs-on: ubuntu-latest
     permissions:
       contents: write

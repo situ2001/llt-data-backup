@@ -10,7 +10,7 @@ const options = { repository: "owner/archive", token: "test-token", commit: "abc
 const api = "https://api.github.com/repos/owner/archive/releases";
 const upload = "https://uploads.github.com/repos/owner/archive/releases/1/assets?name=";
 const url = "https://github.com/owner/archive/releases/tag/fixture";
-const release = { id: 1, tag_name: "fixture", draft: true, html_url: url, assets: [] };
+const release = { id: 1, tag_name: "fixture", html_url: url, assets: [] };
 
 function uploads(bytes: Uint8Array): ExpectedRequest[] {
   return [
@@ -39,69 +39,82 @@ function uploads(bytes: Uint8Array): ExpectedRequest[] {
   ];
 }
 
-test("stages all original assets before publishing a content-addressed release", async () => {
-  const bytes = packageBytes();
-  const tag = `llt-${version}-${validatePackage(bytes, version)}`;
-  const queue = requests([
-    ...sourceRequests(bytes),
-    { url: `${api}?per_page=100&page=1`, body: "[]" },
+function publication(bytes: Uint8Array): ExpectedRequest[] {
+  const tagPrefix = `llt-${version}-${validatePackage(bytes, version)}-`;
+  return [
     {
       url: api, method: "POST", status: 201,
       body: JSON.stringify({ ...release, html_url: "https://github.com/owner/archive/releases/tag/untagged-draft" }),
       inspect: init => {
         const body = JSON.parse(String(init.body));
         assert.equal(body.draft, true);
-        assert.equal(body.tag_name, tag);
+        assert.ok(body.tag_name.startsWith(tagPrefix));
         assert.equal(body.target_commitish, options.commit);
       },
     },
     ...uploads(bytes),
     {
-      url: `${api}/1`, method: "PATCH", body: JSON.stringify({ ...release, draft: false }),
+      url: `${api}/1`, method: "PATCH", body: JSON.stringify(release),
       inspect: init => assert.deepEqual(JSON.parse(String(init.body)), { draft: false, make_latest: "true" }),
     },
-  ]);
-  assert.deepEqual(await Effect.runPromise(backup(options, queue.fetcher)), { status: "published", tag, url });
-  queue.done();
-});
+  ];
+}
 
-test("downloads unchanged-version packages and skips only an already published checksum", async () => {
-  const tags = [];
-  for (const bytes of [packageBytes("first revision"), packageBytes("second revision")]) {
-    const tag = `llt-${version}-${validatePackage(bytes, version)}`;
-    tags.push(tag);
-    const queue = requests([
-      ...sourceRequests(bytes),
-      { url: `${api}?per_page=100&page=1`, body: JSON.stringify([{ ...release, tag_name: tag, draft: false }]) },
-    ]);
-    assert.equal((await Effect.runPromise(backup(options, queue.fetcher))).status, "unchanged");
-    queue.done();
-  }
-  assert.notEqual(tags[0], tags[1]);
-});
-
-test("replaces partial draft assets before completing publication", async () => {
+test("stages all original assets before publishing the first release", async () => {
   const bytes = packageBytes();
-  const tag = `llt-${version}-${validatePackage(bytes, version)}`;
   const queue = requests([
     ...sourceRequests(bytes),
-    {
-      url: `${api}?per_page=100&page=1`,
-      body: JSON.stringify([{ ...release, tag_name: tag, assets: [{ id: 10, name: "an.db" }] }]),
-    },
-    { url: `${api}/assets/10`, method: "DELETE", status: 204 },
-    ...uploads(bytes),
-    { url: `${api}/1`, method: "PATCH", body: JSON.stringify({ ...release, draft: false }) },
+    { url: `${api}/latest`, status: 404 },
+    ...publication(bytes),
   ]);
-  assert.equal((await Effect.runPromise(backup(options, queue.fetcher))).status, "published");
+  const result = await Effect.runPromise(backup(options, queue.fetcher));
+  assert.equal(result.status, "published");
+  assert.equal(result.url, url);
   queue.done();
+});
+
+function latestPackage(bytes: Uint8Array): ExpectedRequest {
+  return {
+    url: `${api}/latest`,
+    body: JSON.stringify({
+      ...release,
+      assets: [{ name: "an.db", digest: `sha256:${validatePackage(bytes, version)}` }],
+    }),
+  };
+}
+
+test("skips publication when the package hash matches the latest release", async () => {
+  const bytes = packageBytes();
+  const queue = requests([...sourceRequests(bytes), latestPackage(bytes)]);
+  assert.deepEqual(await Effect.runPromise(backup(options, queue.fetcher)), {
+    status: "unchanged", tag: release.tag_name, url,
+  });
+  queue.done();
+});
+
+test("publishes A, B, and A again under distinct tags even with the same publisher version", async () => {
+  const first = packageBytes("A");
+  const second = packageBytes("B");
+  const tags = new Set<string>();
+  for (const [bytes, latest] of [
+    [first, { url: `${api}/latest`, status: 404 }],
+    [second, latestPackage(first)],
+    [first, latestPackage(second)],
+  ] satisfies [Uint8Array, ExpectedRequest][]) {
+    const queue = requests([...sourceRequests(bytes), latest, ...publication(bytes)]);
+    const result = await Effect.runPromise(backup(options, queue.fetcher));
+    assert.equal(result.status, "published");
+    tags.add(result.tag);
+    queue.done();
+  }
+  assert.equal(tags.size, 3);
 });
 
 test("does not publish when an asset upload fails", async () => {
   const bytes = packageBytes();
   const queue = requests([
     ...sourceRequests(bytes),
-    { url: `${api}?per_page=100&page=1`, body: "[]" },
+    { url: `${api}/latest`, status: 404 },
     { url: api, method: "POST", status: 201, body: JSON.stringify(release) },
     { url: `${upload}an.db`, method: "POST", status: 502 },
   ]);
@@ -112,26 +125,8 @@ test("does not publish when an asset upload fails", async () => {
 test("does not treat a GitHub permission failure as an empty archive", async () => {
   const queue = requests([
     ...sourceRequests(packageBytes()),
-    { url: `${api}?per_page=100&page=1`, status: 403 },
+    { url: `${api}/latest`, status: 403 },
   ]);
   await assert.rejects(Effect.runPromise(backup(options, queue.fetcher)), /GitHub release request failed/);
-  queue.done();
-});
-
-test("finds archived packages beyond the first API page", async () => {
-  const bytes = packageBytes();
-  const tag = `llt-${version}-${validatePackage(bytes, version)}`;
-  const queue = requests([
-    ...sourceRequests(bytes),
-    {
-      url: `${api}?per_page=100&page=1`,
-      body: JSON.stringify(Array.from({ length: 100 }, (_, index) => ({ ...release, tag_name: `other-${index}` }))),
-    },
-    {
-      url: `${api}?per_page=100&page=2`,
-      body: JSON.stringify([{ ...release, tag_name: tag, draft: false }]),
-    },
-  ]);
-  assert.equal((await Effect.runPromise(backup(options, queue.fetcher))).status, "unchanged");
   queue.done();
 });
